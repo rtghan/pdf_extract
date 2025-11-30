@@ -25,7 +25,7 @@ def main():
         output = {
             "success": True,
             "engine": "markitdown",
-            "output": result.text_content
+            "output": result.text_content if result.text_content else ""
         }
 
         # Only output JSON to stdout - nothing else

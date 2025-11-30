@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { spawn } from "child_process";
 import path from "path";
+import { auth } from "@/lib/auth";
+import { createServerClient } from "@/lib/supabase/server";
+import { uploadPdf, uploadMarkdown } from "@/lib/supabase/storage";
+import { randomUUID } from "crypto";
 
 export const runtime = "nodejs";
 
@@ -77,7 +81,52 @@ export async function POST(req: NextRequest) {
     }
 
     const parsed = JSON.parse(result.output);
-    return NextResponse.json(parsed);
+    console.log("Parsed conversion result:", { success: parsed.success, hasOutput: !!parsed.output, outputLength: parsed.output?.length });
+
+    // If user is logged in, try to save to Supabase (non-blocking)
+    let saved = false;
+    let conversionId: string | undefined;
+
+    try {
+      const session = await auth();
+      console.log("Session check:", { hasSession: !!session, userId: session?.user?.id });
+      if (session?.user?.id && parsed.success) {
+        const supabase = createServerClient();
+        conversionId = randomUUID();
+        const userId = session.user.id;
+
+        // Upload files to storage
+        const pdfPath = await uploadPdf(userId, conversionId, buffer);
+        const mdPath = await uploadMarkdown(userId, conversionId, parsed.output);
+
+        // Save metadata to database
+        await supabase.from("conversions").insert({
+          id: conversionId,
+          user_id: userId,
+          original_filename: file.name,
+          file_size_bytes: file.size,
+          engine: "markitdown",
+          status: "completed",
+          pdf_storage_path: pdfPath,
+          markdown_storage_path: mdPath,
+          markdown_preview: parsed.output.substring(0, 500),
+          word_count: parsed.output.split(/\s+/).length,
+          completed_at: new Date().toISOString(),
+        });
+
+        saved = true;
+        console.log("Successfully saved conversion:", conversionId);
+      }
+    } catch (saveError) {
+      console.error("Failed to save conversion:", saveError);
+    }
+
+    console.log("Returning response:", { success: parsed.success, hasOutput: !!parsed.output, outputLength: parsed.output?.length, saved });
+    return NextResponse.json({
+      ...parsed,
+      ...(conversionId && { conversionId }),
+      ...(saved && { saved: true }),
+    });
 
   } catch (err: any) {
     return NextResponse.json(

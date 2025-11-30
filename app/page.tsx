@@ -6,12 +6,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import PdfUploader from "@/components/pdf-uploader"
 import ConversionResult from "@/components/conversion-result"
+import { UserMenu } from "@/components/auth/user-menu"
 
 const CONVERSION_ENGINES = [
   { id: "markitdown", name: "MarkItDown", endpoint: "/api/extract/markitdown" },
   { id: "tesseract", name: "Tesseract", endpoint: "/api/extract/tesseract" },
-  { id: "mineru", name: "MinerU", endpoint: "/api/extract/mineru" },
-  { id: "pdfparse", name: "PDF-parse", endpoint: null },
+  { id: "mineru", name: "MinerU", endpoint: "/api/extract/mineru" }
 ]
 
 export default function Page() {
@@ -47,6 +47,7 @@ export default function Page() {
       })
 
       const result = await response.json()
+      console.log("Conversion response:", result)
 
       if (!response.ok || !result.success) {
         const errorMessage = result.error || result.details || JSON.stringify(result) || "Conversion failed"
@@ -55,6 +56,7 @@ export default function Page() {
         return
       }
 
+      console.log("Setting markdown result:", result.output?.substring(0, 100))
       setMarkdownResult(result.output)
     } catch (err) {
       setError("Conversion failed. Please try again.")
@@ -73,24 +75,21 @@ export default function Page() {
             <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-primary to-accent" />
             <h1 className="text-xl font-bold">PDF Converter</h1>
           </div>
-          <Button variant="outline" className="border-border hover:bg-secondary bg-transparent">
-            Login
-          </Button>
+          <UserMenu />
         </div>
       </header>
 
       {/* Main Content */}
       <main className="mx-auto max-w-6xl px-6 py-12">
-        <div className="grid gap-6 lg:grid-cols-3">
-          {/* Left Column - Upload and Controls */}
-          <div className="lg:col-span-2 space-y-6">
-            <div className="space-y-2">
-              <h2 className="text-3xl font-bold tracking-tight">Convert PDFs to Markdown</h2>
-              <p className="text-muted-foreground">
-                Upload your PDF file and select a conversion engine to transform it into clean, formatted Markdown text.
-              </p>
-            </div>
+        <div className="space-y-6">
+          <div className="space-y-2">
+            <h2 className="text-3xl font-bold tracking-tight">Convert PDFs to Markdown</h2>
+            <p className="text-muted-foreground">
+              Upload your PDF file and select a conversion engine to transform it into Markdown text.
+            </p>
+          </div>
 
+          <div className="grid gap-6 lg:grid-cols-2">
             {/* PDF Upload Card */}
             <Card className="border-border bg-card/50 backdrop-blur-sm">
               <CardHeader>
@@ -102,7 +101,18 @@ export default function Page() {
               </CardContent>
             </Card>
 
-            {/* Conversion Engine Selector */}
+            {/* Markdown Preview */}
+            <Card className="border-border bg-card/50 backdrop-blur-sm">
+              <CardHeader>
+                <CardTitle>Markdown Preview</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ConversionResult markdown={markdownResult} isLoading={isConverting} />
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Conversion Engine Selector */}
             <Card className="border-border bg-card/50 backdrop-blur-sm">
               <CardHeader>
                 <CardTitle>Conversion Engine</CardTitle>
@@ -121,6 +131,16 @@ export default function Page() {
                     ))}
                   </SelectContent>
                 </Select>
+                {selectedEngine === "markitdown" && (
+                  <p className="text-sm text-amber-600 dark:text-amber-500">
+                    Note: MarkItDown only works with PDFs that contain selectable text.
+                  </p>
+                )}
+                {selectedEngine === "mineru" && (
+                  <p className="text-sm text-amber-600 dark:text-amber-500">
+                    Note: MinerU will likely be significantly slower than other engines.
+                  </p>
+                )}
                 <p className="text-sm text-muted-foreground">
                   {selectedFile ? `File: ${selectedFile.name}` : "No file selected"}
                 </p>
@@ -151,19 +171,6 @@ export default function Page() {
                 <p className="text-sm">{error}</p>
               </div>
             )}
-          </div>
-
-          {/* Right Column - Preview */}
-          <div>
-            <Card className="border-border bg-card/50 backdrop-blur-sm sticky top-6">
-              <CardHeader>
-                <CardTitle>Markdown Preview</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <ConversionResult markdown={markdownResult} isLoading={isConverting} />
-              </CardContent>
-            </Card>
-          </div>
         </div>
       </main>
     </div>

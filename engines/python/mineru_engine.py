@@ -54,7 +54,7 @@ def main():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=data.get("timeout_seconds", 240)
+                timeout=data.get("timeout_seconds", 480)
             )
 
             stdout = proc.stdout
