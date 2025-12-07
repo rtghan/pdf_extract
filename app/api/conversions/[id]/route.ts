@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { createServerClient } from "@/lib/supabase/server";
 import { getSignedUrl, deleteFile } from "@/lib/supabase/storage";
+import type { Conversion } from "@/types/database";
 
 export async function GET(
   req: NextRequest,
@@ -34,28 +35,30 @@ export async function GET(
       );
     }
 
+    const conversion = data as Conversion;
+
     // Generate signed URLs for file downloads
     let pdfUrl = null;
     let markdownUrl = null;
 
-    if (data.pdf_storage_path) {
+    if (conversion.pdf_storage_path) {
       try {
-        pdfUrl = await getSignedUrl("pdfs", data.pdf_storage_path);
+        pdfUrl = await getSignedUrl("pdfs", conversion.pdf_storage_path);
       } catch (e) {
         console.error("Failed to get PDF signed URL:", e);
       }
     }
 
-    if (data.markdown_storage_path) {
+    if (conversion.markdown_storage_path) {
       try {
-        markdownUrl = await getSignedUrl("markdown", data.markdown_storage_path);
+        markdownUrl = await getSignedUrl("markdown", conversion.markdown_storage_path);
       } catch (e) {
         console.error("Failed to get markdown signed URL:", e);
       }
     }
 
     return NextResponse.json({
-      conversion: data,
+      conversion,
       pdfUrl,
       markdownUrl,
     });
@@ -99,18 +102,20 @@ export async function DELETE(
       );
     }
 
+    const conversion = data as Conversion;
+
     // Delete files from storage
-    if (data.pdf_storage_path) {
+    if (conversion.pdf_storage_path) {
       try {
-        await deleteFile("pdfs", data.pdf_storage_path);
+        await deleteFile("pdfs", conversion.pdf_storage_path);
       } catch (e) {
         console.error("Failed to delete PDF:", e);
       }
     }
 
-    if (data.markdown_storage_path) {
+    if (conversion.markdown_storage_path) {
       try {
-        await deleteFile("markdown", data.markdown_storage_path);
+        await deleteFile("markdown", conversion.markdown_storage_path);
       } catch (e) {
         console.error("Failed to delete markdown:", e);
       }
