@@ -121,6 +121,7 @@ export async function DELETE(
       }
     }
 
+    
     // Delete from database
     const { error: deleteError } = await supabase
       .from("conversions")
