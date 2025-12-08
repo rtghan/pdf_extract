@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { createServerClient } from "@/lib/supabase/server";
 import { getSignedUrl, deleteFile } from "@/lib/supabase/storage";
+import { isValidStoragePath } from "@/lib/sanitize";
 import type { Conversion } from "@/types/database";
 
 export async function GET(
@@ -37,11 +38,11 @@ export async function GET(
 
     const conversion = data as Conversion;
 
-    // Generate signed URLs for file downloads
+    // Generate signed URLs for file downloads (with path validation)
     let pdfUrl = null;
     let markdownUrl = null;
 
-    if (conversion.pdf_storage_path) {
+    if (conversion.pdf_storage_path && isValidStoragePath(conversion.pdf_storage_path)) {
       try {
         pdfUrl = await getSignedUrl("pdfs", conversion.pdf_storage_path);
       } catch (e) {
@@ -49,7 +50,7 @@ export async function GET(
       }
     }
 
-    if (conversion.markdown_storage_path) {
+    if (conversion.markdown_storage_path && isValidStoragePath(conversion.markdown_storage_path)) {
       try {
         markdownUrl = await getSignedUrl("markdown", conversion.markdown_storage_path);
       } catch (e) {
@@ -104,8 +105,8 @@ export async function DELETE(
 
     const conversion = data as Conversion;
 
-    // Delete files from storage
-    if (conversion.pdf_storage_path) {
+    // Delete files from storage (with path validation)
+    if (conversion.pdf_storage_path && isValidStoragePath(conversion.pdf_storage_path)) {
       try {
         await deleteFile("pdfs", conversion.pdf_storage_path);
       } catch (e) {
@@ -113,7 +114,7 @@ export async function DELETE(
       }
     }
 
-    if (conversion.markdown_storage_path) {
+    if (conversion.markdown_storage_path && isValidStoragePath(conversion.markdown_storage_path)) {
       try {
         await deleteFile("markdown", conversion.markdown_storage_path);
       } catch (e) {
@@ -121,7 +122,6 @@ export async function DELETE(
       }
     }
 
-    
     // Delete from database
     const { error: deleteError } = await supabase
       .from("conversions")

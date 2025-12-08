@@ -5,6 +5,11 @@ import crypto, { randomUUID } from "crypto";
 import { auth } from "@/lib/auth";
 import { createServerClient } from "@/lib/supabase/server";
 import { uploadPdf, uploadMarkdown } from "@/lib/supabase/storage";
+import { pythonProcessQueue } from "@/lib/process-queue";
+import { sanitizeFilename } from "@/lib/sanitize";
+import { Logger, createRequestLogger, generateRequestId } from "@/lib/logger";
+import { captureException, addBreadcrumb, withTransaction } from "@/lib/sentry";
+import { metrics, METRIC_NAMES, withMetrics } from "@/lib/metrics";
 
 export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 export const ALLOWED_TYPES = ["application/pdf"];
@@ -103,10 +108,20 @@ export function validateFile(file: File | null): { valid: true } | { valid: fals
   return { valid: true };
 }
 
+// Default timeouts for each engine (in milliseconds)
+const ENGINE_TIMEOUTS: Record<EngineType, number> = {
+  markitdown: 120 * 1000, // 2 minutes
+  tesseract: 300 * 1000, // 5 minutes (OCR is slower)
+  mineru: 480 * 1000, // 8 minutes (most complex)
+};
+
 async function runPythonEngine(
   engine: EngineType,
-  payload: string
+  payload: string,
+  timeoutMs?: number,
+  logger?: Logger
 ): Promise<PythonResult> {
+  const log = logger ?? new Logger({ engine });
   const scriptPath = path.join(
     process.cwd(),
     "engines",
@@ -114,11 +129,41 @@ async function runPythonEngine(
     `${engine}_engine.py`
   );
 
+  const timeout = timeoutMs ?? ENGINE_TIMEOUTS[engine];
+  const startTime = performance.now();
+
+  log.debug("Starting Python engine", { scriptPath, timeout_ms: timeout });
+  addBreadcrumb("Starting Python engine", "process", { engine, timeout });
+
   return new Promise((resolve, reject) => {
     const python = spawn("python", [scriptPath]);
+    let isResolved = false;
+    let timeoutHandle: NodeJS.Timeout | null = null;
 
     let output = "";
     let errorOutput = "";
+
+    // Set up timeout to kill the process
+    timeoutHandle = setTimeout(() => {
+      if (!isResolved) {
+        isResolved = true;
+        python.kill("SIGKILL");
+        const duration = Math.round(performance.now() - startTime);
+
+        log.warn("Python process timed out", { duration_ms: duration, timeout_ms: timeout });
+        metrics.incrementCounter(METRIC_NAMES.PYTHON_PROCESS_TIMEOUTS, 1, { engine });
+        metrics.recordTiming(METRIC_NAMES.PYTHON_PROCESS_DURATION, duration, { engine, status: "timeout" });
+
+        resolve({
+          output: JSON.stringify({
+            success: false,
+            error: `Process timed out after ${timeout / 1000} seconds`,
+          }),
+          errorOutput: `Timeout: Process exceeded ${timeout / 1000} second limit`,
+          exitCode: 124, // Standard timeout exit code
+        });
+      }
+    }, timeout);
 
     python.stdout.on("data", (data) => {
       output += data.toString();
@@ -129,7 +174,16 @@ async function runPythonEngine(
     });
 
     python.on("error", (err) => {
-      reject(new Error(`Failed to start Python: ${err.message}`));
+      if (!isResolved) {
+        isResolved = true;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        const duration = Math.round(performance.now() - startTime);
+
+        log.error("Failed to start Python process", err, { duration_ms: duration });
+        metrics.recordTiming(METRIC_NAMES.PYTHON_PROCESS_DURATION, duration, { engine, status: "error" });
+
+        reject(new Error(`Failed to start Python: ${err.message}`));
+      }
     });
 
     python.stdin.on("error", () => {
@@ -137,12 +191,22 @@ async function runPythonEngine(
     });
 
     python.on("close", (exitCode) => {
-      resolve({ output, errorOutput, exitCode: exitCode ?? 1 });
+      if (!isResolved) {
+        isResolved = true;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        const duration = Math.round(performance.now() - startTime);
+        const status = exitCode === 0 ? "success" : "error";
+
+        log.debug("Python process completed", { exitCode, duration_ms: duration });
+        metrics.recordTiming(METRIC_NAMES.PYTHON_PROCESS_DURATION, duration, { engine, status });
+
+        resolve({ output, errorOutput, exitCode: exitCode ?? 1 });
+      }
     });
 
     python.stdin.write(payload, (err) => {
       if (err) {
-        // stdin write failed, but let the process continue to capture stderr
+        log.warn("Failed to write to Python stdin", { error: err.message });
       }
       python.stdin.end();
     });
@@ -177,7 +241,7 @@ async function saveConversion(params: {
     await supabase.from("conversions").insert({
       id: conversionId,
       user_id: userId,
-      original_filename: file.name,
+      original_filename: sanitizeFilename(file.name, { allowedExtensions: ["pdf"] }),
       file_size_bytes: file.size,
       engine,
       status: success ? "completed" : "failed",
@@ -198,6 +262,13 @@ async function saveConversion(params: {
 
 export async function processExtraction(options: ExtractOptions): Promise<NextResponse> {
   const { engine, file, buffer, extraPayload = {} } = options;
+  const requestId = generateRequestId();
+  const log = createRequestLogger(requestId).child({ engine, fileSize: file.size });
+  const startTime = performance.now();
+
+  log.info("Starting extraction", { filename: file.name });
+  addBreadcrumb("Extraction started", "extraction", { engine, fileSize: file.size });
+  metrics.incrementCounter(METRIC_NAMES.EXTRACTION_TOTAL, 1, { engine });
 
   try {
     // Check cache first
@@ -205,6 +276,9 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
     const cachedResult = getCachedResult(cacheKey);
 
     if (cachedResult && cachedResult.success) {
+      log.info("Cache hit", { cacheKey: cacheKey.substring(0, 16) });
+      metrics.incrementCounter(METRIC_NAMES.EXTRACTION_CACHE_HITS, 1, { engine });
+
       // For cached results, still try to save to database if user is logged in
       let conversionId: string | undefined;
       let saved = false;
@@ -224,8 +298,12 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
           saved = saveResult.saved;
         }
       } catch (e) {
-        console.error("Failed to save cached conversion:", e);
+        log.error("Failed to save cached conversion", e);
       }
+
+      const duration = Math.round(performance.now() - startTime);
+      metrics.recordTiming(METRIC_NAMES.EXTRACTION_DURATION, duration, { engine, status: "cache_hit" });
+      log.info("Extraction completed (cached)", { duration_ms: duration });
 
       return NextResponse.json({
         success: true,
@@ -237,15 +315,30 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
       });
     }
 
-    // Run Python engine
+    // Run Python engine with concurrency limiting
     const base64pdf = buffer.toString("base64");
     const payload = JSON.stringify({ pdf: base64pdf, ...extraPayload });
-    const result = await runPythonEngine(engine, payload);
+
+    // Extract custom timeout if provided (in seconds, convert to ms)
+    const customTimeoutMs =
+      typeof extraPayload.timeout_seconds === "number"
+        ? extraPayload.timeout_seconds * 1000
+        : undefined;
+
+    log.debug("Submitting to process queue");
+    addBreadcrumb("Submitting to process queue", "queue", { engine });
+
+    const result = await pythonProcessQueue.execute(() =>
+      runPythonEngine(engine, payload, customTimeoutMs, log)
+    );
 
     // Handle Python errors
     if (result.exitCode !== 0) {
       const errorMessage = result.errorOutput || result.output || "Python error";
-      console.error(`${engine} Python error:`, errorMessage);
+      log.error("Python engine failed", new Error(errorMessage), { exitCode: result.exitCode });
+
+      metrics.incrementCounter(METRIC_NAMES.EXTRACTION_ERRORS, 1, { engine, reason: "python_error" });
+      captureException(new Error(errorMessage), { engine, requestId, extras: { exitCode: result.exitCode } });
 
       // Save failed conversion to database
       let conversionId: string | undefined;
@@ -263,8 +356,11 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
           conversionId = saveResult.conversionId;
         }
       } catch (e) {
-        console.error("Failed to save failed conversion:", e);
+        log.error("Failed to save failed conversion", e);
       }
+
+      const duration = Math.round(performance.now() - startTime);
+      metrics.recordTiming(METRIC_NAMES.EXTRACTION_DURATION, duration, { engine, status: "error" });
 
       // Try to parse JSON error from Python
       try {
@@ -288,6 +384,7 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
 
     // Parse successful result
     const parsed = JSON.parse(result.output);
+    log.debug("Python output parsed", { success: parsed.success });
 
     // Cache successful result
     if (parsed.success) {
@@ -296,6 +393,7 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
         output: parsed.output,
         engine,
       });
+      log.debug("Result cached", { cacheKey: cacheKey.substring(0, 16) });
     }
 
     // Save to database
@@ -316,10 +414,16 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
         });
         conversionId = saveResult.conversionId;
         saved = saveResult.saved;
+        log.debug("Conversion saved to database", { conversionId, saved });
       }
     } catch (e) {
-      console.error("Failed to save conversion:", e);
+      log.error("Failed to save conversion", e);
     }
+
+    const duration = Math.round(performance.now() - startTime);
+    const status = parsed.success ? "success" : "error";
+    metrics.recordTiming(METRIC_NAMES.EXTRACTION_DURATION, duration, { engine, status });
+    log.info("Extraction completed", { success: parsed.success, duration_ms: duration, conversionId });
 
     return NextResponse.json({
       ...parsed,
@@ -329,6 +433,35 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
     });
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : "Unknown error";
+    log.error("Extraction failed with exception", err);
+
+    // Check if this is a queue-related error (server busy)
+    const isQueueError =
+      errorMessage.includes("Queue is full") ||
+      errorMessage.includes("timed out waiting in queue") ||
+      errorMessage.includes("Server is busy");
+
+    // Don't save queue errors to database - they're not conversion failures
+    if (isQueueError) {
+      metrics.incrementCounter(METRIC_NAMES.QUEUE_REJECTIONS, 1, { engine });
+      log.warn("Request rejected due to queue capacity", { error: errorMessage });
+
+      const duration = Math.round(performance.now() - startTime);
+      metrics.recordTiming(METRIC_NAMES.EXTRACTION_DURATION, duration, { engine, status: "queue_rejected" });
+
+      return NextResponse.json(
+        {
+          success: false,
+          engine,
+          error: errorMessage,
+        },
+        { status: 503 } // Service Unavailable
+      );
+    }
+
+    // Track non-queue errors
+    metrics.incrementCounter(METRIC_NAMES.EXTRACTION_ERRORS, 1, { engine, reason: "exception" });
+    captureException(err, { engine, requestId });
 
     // Try to save the error
     let conversionId: string | undefined;
@@ -346,8 +479,11 @@ export async function processExtraction(options: ExtractOptions): Promise<NextRe
         conversionId = saveResult.conversionId;
       }
     } catch (e) {
-      console.error("Failed to save error conversion:", e);
+      log.error("Failed to save error conversion", e);
     }
+
+    const duration = Math.round(performance.now() - startTime);
+    metrics.recordTiming(METRIC_NAMES.EXTRACTION_DURATION, duration, { engine, status: "error" });
 
     return NextResponse.json(
       {

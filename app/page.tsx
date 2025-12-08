@@ -1,9 +1,10 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useCallback, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Progress } from "@/components/ui/progress"
 import PdfUploader from "@/components/pdf-uploader"
 import ConversionResult from "@/components/conversion-result"
 import { UserMenu } from "@/components/auth/user-menu"
@@ -14,57 +15,137 @@ const CONVERSION_ENGINES = [
   { id: "mineru", name: "MinerU", endpoint: "/api/extract/mineru" }
 ]
 
+interface ProgressState {
+  percent: number
+  message: string
+  stage: string
+}
+
 export default function Page() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [selectedEngine, setSelectedEngine] = useState(CONVERSION_ENGINES[0].id)
   const [isConverting, setIsConverting] = useState(false)
   const [markdownResult, setMarkdownResult] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [progress, setProgress] = useState<ProgressState | null>(null)
+  const [displayProgress, setDisplayProgress] = useState(0)
+  const progressIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
-  const handleConvert = async () => {
-    if (!selectedFile) {
-      setError("Please upload a PDF file first")
-      return
+  // Aesthetic progress bar animation - animates to ~50% while waiting for response
+  useEffect(() => {
+    if (isConverting && !markdownResult) {
+      setDisplayProgress(0)
+      progressIntervalRef.current = setInterval(() => {
+        setDisplayProgress((prev) => {
+          // Slow down as we approach 50%
+          if (prev >= 50) return prev
+          const increment = Math.max(0.5, (50 - prev) / 20)
+          return Math.min(50, prev + increment)
+        })
+      }, 100)
+    } else if (markdownResult) {
+      // Jump to 100% when complete
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current)
+      }
+      setDisplayProgress(100)
+    } else {
+      // Reset when not converting
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current)
+      }
+      setDisplayProgress(0)
     }
 
-    const engine = CONVERSION_ENGINES.find((e) => e.id === selectedEngine)
-    if (!engine?.endpoint) {
-      setError(`${engine?.name || "Selected engine"} is not yet implemented`)
+    return () => {
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current)
+      }
+    }
+  }, [isConverting, markdownResult])
+
+  const handleConvert = useCallback(async () => {
+    if (!selectedFile) {
+      setError("Please upload a PDF file first")
       return
     }
 
     setIsConverting(true)
     setError(null)
     setMarkdownResult(null)
+    setProgress({ percent: 0, message: "Starting conversion...", stage: "initializing" })
 
     try {
       const formData = new FormData()
       formData.append("file", selectedFile)
+      formData.append("engine", selectedEngine)
 
-      const response = await fetch(engine.endpoint, {
+      // Use streaming endpoint
+      const response = await fetch("/api/extract/stream", {
         method: "POST",
         body: formData,
       })
 
-      const result = await response.json()
-      console.log("Conversion response:", result)
-
-      if (!response.ok || !result.success) {
-        const errorMessage = result.error || result.details || JSON.stringify(result) || "Conversion failed"
-        setError(errorMessage)
-        console.error("Conversion error:", result)
+      if (!response.ok && !response.body) {
+        setError("Failed to start conversion")
+        setIsConverting(false)
         return
       }
 
-      console.log("Setting markdown result:", result.output?.substring(0, 100))
-      setMarkdownResult(result.output)
+      const reader = response.body?.getReader()
+      if (!reader) {
+        setError("Failed to read response stream")
+        setIsConverting(false)
+        return
+      }
+
+      const decoder = new TextDecoder()
+      let buffer = ""
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(line.slice(6))
+
+              if (event.type === "progress") {
+                setProgress({
+                  percent: event.percent ?? 0,
+                  message: event.message ?? "Processing...",
+                  stage: event.stage ?? "processing",
+                })
+              } else if (event.type === "result") {
+                if (event.result?.success) {
+                  setMarkdownResult(event.result.output)
+                  setProgress({ percent: 100, message: "Complete!", stage: "complete" })
+                } else {
+                  setError(event.result?.error || "Conversion failed")
+                }
+                setIsConverting(false)
+              } else if (event.type === "error") {
+                setError(event.message || "Conversion failed")
+                setIsConverting(false)
+              }
+            } catch (e) {
+              console.error("Failed to parse SSE event:", e)
+            }
+          }
+        }
+      }
     } catch (err) {
       setError("Conversion failed. Please try again.")
       console.error(err)
     } finally {
       setIsConverting(false)
     }
-  }
+  }, [selectedFile, selectedEngine])
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background to-secondary/20">
@@ -147,6 +228,21 @@ export default function Page() {
               </CardContent>
             </Card>
 
+            {/* Progress Bar */}
+            {isConverting && (
+              <Card className="border-border bg-card/50 backdrop-blur-sm">
+                <CardContent className="pt-6">
+                  <div className="space-y-3">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">{progress?.message || "Processing..."}</span>
+                      <span className="font-medium">{Math.round(displayProgress)}%</span>
+                    </div>
+                    <Progress value={displayProgress} className="h-2" />
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
             {/* Convert Button */}
             <Button
               onClick={handleConvert}
@@ -157,7 +253,7 @@ export default function Page() {
               {isConverting ? (
                 <div className="flex items-center gap-2">
                   <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                  Converting...
+                  {progress?.message || "Converting..."}
                 </div>
               ) : (
                 "Convert to Markdown"
